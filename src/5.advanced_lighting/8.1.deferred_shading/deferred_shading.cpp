@@ -19,10 +19,12 @@ void processInput(GLFWwindow *window);
 unsigned int loadTexture(const char *path, bool gammaCorrection);
 void renderQuad();
 void renderCube();
+unsigned int gen_color_attachment();
+void renderPostProcessPass(Shader shader, bool isFinal = false);
 
 // settings
-const unsigned int SCR_WIDTH = 800;
-const unsigned int SCR_HEIGHT = 600;
+const unsigned int SCR_WIDTH = 1600;
+const unsigned int SCR_HEIGHT = 1200;
 
 // camera
 Camera camera(glm::vec3(0.0f, 0.0f, 5.0f));
@@ -33,6 +35,13 @@ bool firstMouse = true;
 // timing
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
+
+// post processing
+int nextFBO = 1;
+unsigned int ppFBO[2];
+unsigned int colorAttachment[2];
+unsigned int edgeFBO;
+unsigned int edgeAttachment;
 
 int main()
 {
@@ -84,20 +93,20 @@ int main()
     Shader shaderGeometryPass("8.1.g_buffer.vs", "8.1.g_buffer.fs");
     Shader shaderLightingPass("8.1.deferred_shading.vs", "8.1.deferred_shading.fs");
     Shader shaderLightBox("8.1.deferred_light_box.vs", "8.1.deferred_light_box.fs");
+    Shader shaderBlur("shaders/postprocessing.vert", "shaders/gaussblur.frag");
+    Shader shaderCanvas("shaders/postprocessing.vert", "shaders/canvas.frag");
+    Shader shaderVoronoi("shaders/postprocessing.vert", "shaders/voronoi.frag");
+    Shader shaderEdge("shaders/postprocessing.vert", "shaders/edge.frag");
+    Shader shaderAddEdge("shaders/postprocessing.vert", "shaders/addedges.frag");
+    Shader shaderPigment("shaders/postprocessing.vert", "shaders/pigment.frag");
+    Shader shaderWhite("shaders/postprocessing.vert", "shaders/white.frag");
 
     // load models
     // -----------
     Model backpack(FileSystem::getPath("resources/objects/backpack/backpack.obj"));
     std::vector<glm::vec3> objectPositions;
-    objectPositions.push_back(glm::vec3(-3.0,  -0.5, -3.0));
-    objectPositions.push_back(glm::vec3( 0.0,  -0.5, -3.0));
-    objectPositions.push_back(glm::vec3( 3.0,  -0.5, -3.0));
-    objectPositions.push_back(glm::vec3(-3.0,  -0.5,  0.0));
     objectPositions.push_back(glm::vec3( 0.0,  -0.5,  0.0));
-    objectPositions.push_back(glm::vec3( 3.0,  -0.5,  0.0));
-    objectPositions.push_back(glm::vec3(-3.0,  -0.5,  3.0));
-    objectPositions.push_back(glm::vec3( 0.0,  -0.5,  3.0));
-    objectPositions.push_back(glm::vec3( 3.0,  -0.5,  3.0));
+
 
 
     // configure g-buffer framebuffer
@@ -140,6 +149,37 @@ int main()
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         std::cout << "Framebuffer not complete!" << std::endl;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+    // create 2 framebuffers for post processing
+    // ------------------------
+    glGenFramebuffers(1, &ppFBO[0]);
+    glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[0]);
+
+    colorAttachment[0] = gen_color_attachment();
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorAttachment[0], 0);
+
+    glGenFramebuffers(1, &ppFBO[1]);
+    glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[1]);
+
+    colorAttachment[1] = gen_color_attachment();
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorAttachment[1], 0);
+
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    // create a buffer for edge darkening
+    // ----------------------------------
+    glGenFramebuffers(1, &edgeFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, edgeFBO);
+    
+    edgeAttachment = gen_color_attachment();
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, edgeAttachment, 0);
+
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cout << "Framebuffer not complete!" << std::endl;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // lighting info
     // -------------
@@ -158,7 +198,7 @@ int main()
         float rColor = static_cast<float>(((rand() % 100) / 200.0f) + 0.5); // between 0.5 and 1.0
         float gColor = static_cast<float>(((rand() % 100) / 200.0f) + 0.5); // between 0.5 and 1.0
         float bColor = static_cast<float>(((rand() % 100) / 200.0f) + 0.5); // between 0.5 and 1.0
-        lightColors.push_back(glm::vec3(rColor, gColor, bColor));
+        lightColors.push_back(glm::vec3(rColor, gColor, bColor) * 1.2f);
     }
 
     // shader configuration
@@ -167,6 +207,21 @@ int main()
     shaderLightingPass.setInt("gPosition", 0);
     shaderLightingPass.setInt("gNormal", 1);
     shaderLightingPass.setInt("gAlbedoSpec", 2);
+    // send light relevant uniforms
+    for (unsigned int i = 0; i < lightPositions.size(); i++)
+    {
+        shaderLightingPass.setVec3("lights[" + std::to_string(i) + "].Position", lightPositions[i]);
+        shaderLightingPass.setVec3("lights[" + std::to_string(i) + "].Color", lightColors[i]);
+        // update attenuation parameters and calculate radius
+        const float linear = 0.7f;
+        const float quadratic = 1.8f;
+        shaderLightingPass.setFloat("lights[" + std::to_string(i) + "].Linear", linear);
+        shaderLightingPass.setFloat("lights[" + std::to_string(i) + "].Quadratic", quadratic);
+    }
+
+    // post processing shaders
+    shaderBlur.use();
+    shaderBlur.setInt("samplerColor", 0);
 
     // render loop
     // -----------
@@ -190,7 +245,9 @@ int main()
         // 1. geometry pass: render scene's geometry/color data into gbuffer
         // -----------------------------------------------------------------
         glBindFramebuffer(GL_FRAMEBUFFER, gBuffer);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
             glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
             glm::mat4 view = camera.GetViewMatrix();
             glm::mat4 model = glm::mat4(1.0f);
@@ -217,17 +274,7 @@ int main()
         glBindTexture(GL_TEXTURE_2D, gNormal);
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, gAlbedoSpec);
-        // send light relevant uniforms
-        for (unsigned int i = 0; i < lightPositions.size(); i++)
-        {
-            shaderLightingPass.setVec3("lights[" + std::to_string(i) + "].Position", lightPositions[i]);
-            shaderLightingPass.setVec3("lights[" + std::to_string(i) + "].Color", lightColors[i]);
-            // update attenuation parameters and calculate radius
-            const float linear = 0.7f;
-            const float quadratic = 1.8f;
-            shaderLightingPass.setFloat("lights[" + std::to_string(i) + "].Linear", linear);
-            shaderLightingPass.setFloat("lights[" + std::to_string(i) + "].Quadratic", quadratic);
-        }
+        
         shaderLightingPass.setVec3("viewPos", camera.Position);
         // finally render quad
         renderQuad();
@@ -244,6 +291,7 @@ int main()
 
         // 3. render lights on top of scene
         // --------------------------------
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         shaderLightBox.use();
         shaderLightBox.setMat4("projection", projection);
         shaderLightBox.setMat4("view", view);
@@ -254,14 +302,145 @@ int main()
             model = glm::scale(model, glm::vec3(0.125f));
             shaderLightBox.setMat4("model", model);
             shaderLightBox.setVec3("lightColor", lightColors[i]);
-            renderCube();
+            //renderCube();
         }
 
+        // 4. render the white sky box
+        model = glm::mat4(1.0f);
+        model = glm::scale(model, glm::vec3(50.0f));
+        shaderLightBox.setMat4("model", model);
+        shaderLightBox.setVec3("lightColor", glm::vec3(0.8f));
+        renderCube();
+
+        // blit from the default framebuffer to the temp framebuffer
+        // -----------------------------
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ppFBO[0]);
+        glBlitFramebuffer(0, 0, SCR_WIDTH, SCR_HEIGHT, 0, 0, SCR_WIDTH, SCR_HEIGHT, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        // render edges to edge framebuffer
+        // --------------------------
+        glBindFramebuffer(GL_FRAMEBUFFER, edgeFBO);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[0]);
+
+        shaderEdge.use();
+        renderQuad();
+
+        
+        // blur the edges
+        // -----------------------------
+        // verticals
+        shaderBlur.use();
+        shaderBlur.setFloat("blurScale", 2.0f);
+        glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[1]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, edgeAttachment);
+        
+        shaderBlur.use();
+        shaderBlur.setInt("blurdirection", 0);
+        renderQuad();
+
+        // horizontal
+        glBindFramebuffer(GL_FRAMEBUFFER, edgeFBO);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[1]);
+
+        shaderBlur.use();
+        shaderBlur.setInt("blurdirection", 1);
+        renderQuad();
+        
+        // blend the original and the egdes
+        // --------------------------------
+        glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[1]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[0]);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, edgeAttachment);
+
+        shaderAddEdge.use();
+        shaderAddEdge.setInt("original", 0);
+        shaderAddEdge.setInt("edges", 1);
+        renderQuad();
+        nextFBO = 0;
+
+        /*
+        // do the vertical blur
+        // ------------------------------
+        shaderBlur.use();
+        shaderBlur.setInt("blurdirection", 0);
+        renderPostProcessPass(shaderBlur);
+        
+
+        // do the horizontal blur
+        // ---------------------------
+        shaderBlur.use();
+        shaderBlur.setInt("blurdirection", 1);
+        renderPostProcessPass(shaderBlur);
+        */
+
+        // Apply pigments
+        // --------------------------------
+        shaderPigment.use();
+        shaderPigment.setFloat("timeOffset", glfwGetTime());
+        renderPostProcessPass(shaderPigment);
+
+        // Apply white strips
+        // --------------------------------
+        // blur the edges more
+        // vertical
+        /*glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[nextFBO]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, edgeAttachment);
+
+        shaderBlur.use();
+        shaderBlur.setInt("blurdirection", 0);
+        renderQuad();
+
+        // horizontal
+        glBindFramebuffer(GL_FRAMEBUFFER, edgeFBO);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[nextFBO]);*/
+
+        // add white strips to the image
+        glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[nextFBO]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[1 - nextFBO]);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, edgeAttachment);
+
+        shaderWhite.use();
+        shaderWhite.setInt("samplerColor", 0);
+        shaderWhite.setInt("edgeColor", 1);
+        shaderWhite.setFloat("timeOffset", glfwGetTime());
+        renderQuad();
+        nextFBO = 1 - nextFBO;
+        
+        // Apply voronoi
+        // --------------------------------
+        shaderVoronoi.use();
+        shaderVoronoi.setFloat("timeOffset", glfwGetTime());
+        renderPostProcessPass(shaderVoronoi);
+
+        // Apply canvas shading
+        // --------------------------------
+        shaderCanvas.use();
+        shaderCanvas.setFloat("timeOffset", glfwGetTime());
+        renderPostProcessPass(shaderCanvas, true);
+        
 
         // glfw: swap buffers and poll IO events (keys pressed/released, mouse moved etc.)
         // -------------------------------------------------------------------------------
         glfwSwapBuffers(window);
         glfwPollEvents();
+        
     }
 
     glfwTerminate();
@@ -342,7 +521,6 @@ void renderCube()
     glDrawArrays(GL_TRIANGLES, 0, 36);
     glBindVertexArray(0);
 }
-
 
 // renderQuad() renders a 1x1 XY quad in NDC
 // -----------------------------------------
@@ -428,4 +606,34 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn)
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 {
     camera.ProcessMouseScroll(static_cast<float>(yoffset));
+}
+
+unsigned int gen_color_attachment()
+{
+    unsigned int colorAttachment;
+
+    glGenTextures(1, &colorAttachment);
+    glBindTexture(GL_TEXTURE_2D, colorAttachment);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    return colorAttachment;
+}
+
+void renderPostProcessPass(Shader shader, bool isFinal /* = false */)
+{
+    if (!isFinal)
+        glBindFramebuffer(GL_FRAMEBUFFER, ppFBO[nextFBO]);
+    else
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+        glClear(GL_COLOR_BUFFER_BIT);
+        nextFBO = 1 - nextFBO;
+
+        shader.use();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, colorAttachment[nextFBO]);
+        renderQuad();
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
